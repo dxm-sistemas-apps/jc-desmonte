@@ -1,0 +1,463 @@
+/* ============================================================================
+   JETCONTROL 2026®™ — SINCRONIZAÇÃO EM NUVEM (Firebase Firestore)
+   ============================================================================
+   O QUE ESTE ARQUIVO FAZ:
+
+   1) Ao abrir qualquer página do sistema, ele busca na nuvem a versão mais
+      recente de cada dado (ciclos, escalas, cotas extras, valores etc.) e
+      atualiza o localStorage deste navegador, se a nuvem tiver algo mais
+      novo do que o que já está aqui.
+
+   2) A partir daí, sempre que o próprio site salvar algo no localStorage
+      (exatamente como já fazia antes — nenhuma função foi alterada), este
+      arquivo intercepta essa gravação e também envia uma cópia para a
+      nuvem, em segundo plano, sem travar a tela.
+
+   3) Se a nuvem não estiver configurada, ou não houver internet no
+      momento, o site continua funcionando 100% normalmente com os dados
+      salvos localmente — exatamente como funcionava antes deste arquivo
+      existir. Nada é bloqueado nem quebrado por falta de conexão.
+
+   NÃO É NECESSÁRIO mexer em mais nada além das DUAS linhas de configuração
+   logo abaixo. Todas as chaves que o sistema já usa (que começam com
+   "jetcontrol_") são sincronizadas automaticamente — inclusive chaves
+   novas que venham a ser criadas no futuro.
+   ============================================================================ */
+(function () {
+  'use strict';
+
+  // ==========================================================================
+  // CONFIGURAÇÃO — PREENCHA ESTAS DUAS LINHAS E PRONTO
+  // ==========================================================================
+  // FIREBASE_PROJECT_ID: o "ID do projeto" que aparece nas configurações do
+  //                       seu projeto Firebase (ex.: "jetcontrol-2026-abcde").
+  // SYNC_SECRET:          um código só seu, inventado por você (uma senha
+  //                       longa qualquer). Ele TEM que ser idêntico ao valor
+  //                       colocado nas regras de segurança do Firestore
+  //                       (veja o guia de configuração).
+  var FIREBASE_PROJECT_ID = 'jetcontrol-2026-desmonte';
+  var SYNC_SECRET          = 'jetcontrol-2026-desmonte2009';
+  // ==========================================================================
+  // NÃO É NECESSÁRIO ALTERAR NADA ABAIXO DESTA LINHA
+  // ==========================================================================
+
+  var PREFIXO_SINCRONIZADO = 'jetcontrol_';
+  var CHAVE_META = '__jetcontrol_sync_meta__';
+  var CHAVE_MARCADOR_RESET = 'sistema_reset_marker';
+  var CHAVE_RESET_APLICADO = 'jetcontrol_reset_aplicado_em';
+  var ATRASO_ENVIO_MS = 700;   // agrupa gravações rápidas (ex.: digitação) antes de enviar
+  var TEMPO_LIMITE_MS = 8000;  // cobre a busca de TODAS as páginas de dados; se não responder nesse tempo, segue só com dados locais
+
+  var configurado =
+    FIREBASE_PROJECT_ID.indexOf('COLOQUE-AQUI') === -1 &&
+    SYNC_SECRET.indexOf('COLOQUE-AQUI') === -1 &&
+    FIREBASE_PROJECT_ID.length > 0 &&
+    SYNC_SECRET.length > 0 &&
+    typeof fetch === 'function';
+
+  var URL_BASE = 'https://firestore.googleapis.com/v1/projects/' +
+    encodeURIComponent(FIREBASE_PROJECT_ID) +
+    '/databases/(default)/documents/jetcontrol_sync/' +
+    encodeURIComponent(SYNC_SECRET) + '/dados';
+
+  // Guarda referências originais ANTES de qualquer substituição, para que
+  // o próprio motor de sincronização nunca dispare a si mesmo por engano.
+  var originalSetItem = Storage.prototype.setItem;
+  var originalRemoveItem = Storage.prototype.removeItem;
+  var originalGetItem = Storage.prototype.getItem;
+
+  function lerMeta() {
+    try {
+      return JSON.parse(originalGetItem.call(localStorage, CHAVE_META)) || {};
+    } catch (e) {
+      return {};
+    }
+  }
+
+  function salvarMeta(meta) {
+    try {
+      originalSetItem.call(localStorage, CHAVE_META, JSON.stringify(meta));
+    } catch (e) { /* localStorage indisponível/cheio: ignora silenciosamente */ }
+  }
+
+  function decodificarDocumento(fields) {
+    var valor = (fields && fields.value && typeof fields.value.stringValue === 'string')
+      ? fields.value.stringValue : null;
+    var carimbo = (fields && fields.atualizadoEm && fields.atualizadoEm.integerValue)
+      ? parseInt(fields.atualizadoEm.integerValue, 10) : 0;
+    var apagado = !!(fields && fields.deleted && fields.deleted.booleanValue);
+    return { valor: valor, atualizadoEm: carimbo, apagado: apagado };
+  }
+
+  // ------------------------- ENVIO (LOCAL → NUVEM) -------------------------
+  var timersPendentes = {};
+  var pendentes = {};
+
+  // ----- FILA DE ENVIOS PENDENTES (sobrevive a fechar o app / ficar offline) -----
+  // Toda alteração entra aqui ao ser agendada e só sai quando a nuvem CONFIRMA
+  // o recebimento. Se estiver sem internet (ou a nuvem falhar), o item fica na
+  // fila e é reenviado quando a conexão voltar, a cada verificação periódica e
+  // na próxima abertura do app. O valor enviado é sempre o ATUAL do aparelho.
+  var CHAVE_FILA = '__jetcontrol_sync_fila__';
+
+  function lerFila() {
+    try { return JSON.parse(originalGetItem.call(localStorage, CHAVE_FILA) || '{}') || {}; }
+    catch (e) { return {}; }
+  }
+  function salvarFila(fila) {
+    try {
+      if (Object.keys(fila).length === 0) originalRemoveItem.call(localStorage, CHAVE_FILA);
+      else originalSetItem.call(localStorage, CHAVE_FILA, JSON.stringify(fila));
+    } catch (e) {}
+    atualizarIndicador();
+  }
+  function entrarNaFila(chave, apagar, carimbo) {
+    var fila = lerFila();
+    fila[chave] = { apagar: !!apagar, carimbo: carimbo };
+    salvarFila(fila);
+  }
+  function sairDaFila(chave, carimbo) {
+    var fila = lerFila();
+    // Só remove se não houve uma edição mais nova da mesma chave nesse meio-tempo.
+    if (fila[chave] && fila[chave].carimbo <= carimbo) {
+      delete fila[chave];
+      salvarFila(fila);
+    }
+  }
+
+  var reenviandoFila = false;
+  function reenviarFila() {
+    if (!configurado || reenviandoFila) return Promise.resolve();
+    var fila = lerFila();
+    var chaves = Object.keys(fila);
+    if (chaves.length === 0) return Promise.resolve();
+    reenviandoFila = true;
+    var meta = lerMeta();
+    var envios = [];
+    chaves.forEach(function (chave) {
+      var item = fila[chave];
+      // Já tem envio normal agendado para esta chave: ele cuida disso.
+      if (timersPendentes[chave] && pendentes[chave]) return;
+      // A nuvem já tem algo mais novo (de outro aparelho): não sobrescrever.
+      if ((meta[chave] || 0) > item.carimbo) { sairDaFila(chave, item.carimbo); return; }
+      var valor = originalGetItem.call(localStorage, chave);
+      var apagar = item.apagar || valor === null;
+      envios.push(enviarAgora(chave, apagar ? null : valor, apagar, item.carimbo));
+    });
+    return Promise.all(envios).then(function () { reenviandoFila = false; },
+                                    function () { reenviandoFila = false; });
+  }
+
+  // ----- INDICADOR NA TELA (só aparece se estiver offline ou com envios pendentes) -----
+  var indicadorEl = null;
+  function atualizarIndicador() {
+    if (window.parent !== window) return;           // não mostrar dentro de quadros invisíveis
+    if (!document.body) { document.addEventListener('DOMContentLoaded', atualizarIndicador); return; }
+    var qtd = Object.keys(lerFila()).length;
+    var offline = (typeof navigator !== 'undefined') && navigator.onLine === false;
+    if (!offline && qtd === 0) { if (indicadorEl) indicadorEl.style.display = 'none'; return; }
+    if (!indicadorEl) {
+      indicadorEl = document.createElement('div');
+      indicadorEl.setAttribute('role', 'status');
+      indicadorEl.style.cssText = 'position:fixed;left:12px;bottom:84px;z-index:99998;padding:6px 12px;border-radius:999px;font:700 11px/1.2 system-ui,sans-serif;letter-spacing:.03em;box-shadow:0 4px 14px rgba(0,0,0,.4);pointer-events:none;text-transform:uppercase';
+      document.body.appendChild(indicadorEl);
+    }
+    indicadorEl.style.display = 'block';
+    indicadorEl.style.background = offline ? '#b45309' : '#1d4ed8';
+    indicadorEl.style.color = '#fff';
+    var txt = offline ? 'Offline — dados salvos neste aparelho' : 'Sincronizando…';
+    if (qtd > 0) txt += ' · ' + qtd + ' pendente' + (qtd > 1 ? 's' : '');
+    indicadorEl.textContent = txt;
+  }
+  window.addEventListener('online', function () { atualizarIndicador(); reenviarFila(); });
+  window.addEventListener('offline', atualizarIndicador);
+  document.addEventListener('DOMContentLoaded', atualizarIndicador);
+
+  // Ao fechar/trocar de página, envia já o que ainda estava aguardando o atraso.
+  function descarregarPendentes() {
+    Object.keys(pendentes).forEach(function (chave) {
+      var p = pendentes[chave];
+      clearTimeout(timersPendentes[chave]);
+      delete pendentes[chave];
+      enviarAgora(chave, p.valor, p.apagar, p.carimbo, true);
+    });
+  }
+  window.addEventListener('pagehide', descarregarPendentes);
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'hidden') descarregarPendentes();
+  });
+
+  // -----------------------------------------------------------------------
+  // CORREÇÃO DE CORRIDA (LOCAL PENDENTE x SINCRONIZAÇÃO):
+  // O envio para a nuvem é adiado por ATRASO_ENVIO_MS (agrupa digitação
+  // rápida). Antes, o carimbo de tempo local (meta[chave]) só era gravado
+  // quando o envio de fato acontecia — ou seja, durante essa janela de
+  // espera, o dado já estava salvo no localStorage, mas o "meta" ainda
+  // achava que a última atualização era mais antiga. Se o ciclo de
+  // verificação automática (a cada poucos segundos) rodasse nesse meio-
+  // tempo, ele podia comparar contra esse carimbo desatualizado e
+  // sobrescrever a edição local recém-feita com um valor mais antigo vindo
+  // da nuvem, antes mesmo dela ter sido enviada.
+  //
+  // Agora o carimbo é gravado assim que a edição é agendada (aqui embaixo),
+  // não quando o envio de fato ocorre. Assim, qualquer sincronização que
+  // rode durante a espera já "sabe" que o dado local é mais recente e não
+  // o sobrescreve.
+  // -----------------------------------------------------------------------
+  function agendarEnvio(chave, valor, apagar) {
+    if (!configurado) return;
+    clearTimeout(timersPendentes[chave]);
+
+    var carimboDestaEdicao = Date.now();
+    var meta = lerMeta();
+    meta[chave] = carimboDestaEdicao;
+    salvarMeta(meta);
+    entrarNaFila(chave, apagar, carimboDestaEdicao);
+
+    pendentes[chave] = { valor: valor, apagar: apagar, carimbo: carimboDestaEdicao };
+    timersPendentes[chave] = setTimeout(function () {
+      delete pendentes[chave];
+      enviarAgora(chave, valor, apagar, carimboDestaEdicao);
+    }, ATRASO_ENVIO_MS);
+  }
+
+  // "carimbo" é o horário definido no momento em que a edição foi agendada
+  // (não quando o envio de fato acontece), para ficar consistente com o
+  // valor já gravado em meta[chave] por agendarEnvio.
+  function enviarAgora(chave, valor, apagar, carimbo, keepalive) {
+    var agora = carimbo || Date.now();
+    var mascara = apagar
+      ? '?updateMask.fieldPaths=deleted&updateMask.fieldPaths=atualizadoEm'
+      : '?updateMask.fieldPaths=value&updateMask.fieldPaths=atualizadoEm&updateMask.fieldPaths=deleted';
+
+    var campos = apagar
+      ? { deleted: { booleanValue: true }, atualizadoEm: { integerValue: String(agora) } }
+      : {
+          value: { stringValue: valor },
+          atualizadoEm: { integerValue: String(agora) },
+          deleted: { booleanValue: false }
+        };
+
+    return fetch(URL_BASE + '/' + encodeURIComponent(chave) + mascara, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fields: campos }),
+      keepalive: !!keepalive
+    }).then(function (resposta) {
+      if (resposta && resposta.ok) sairDaFila(chave, agora);   // nuvem confirmou
+    }).catch(function () {
+      // Sem internet ou nuvem fora do ar: o dado continua salvo localmente e
+      // PERMANECE NA FILA, sendo reenviado quando a conexão voltar.
+    });
+  }
+
+  // Substitui setItem/removeItem para, além de continuar fazendo
+  // exatamente o que já faziam, também sincronizar em segundo plano.
+  Storage.prototype.setItem = function (chave, valor) {
+    originalSetItem.call(this, chave, valor);
+    if (this === localStorage && chave !== CHAVE_META && chave.indexOf(PREFIXO_SINCRONIZADO) === 0) {
+      agendarEnvio(chave, valor, false);
+    }
+  };
+
+  Storage.prototype.removeItem = function (chave) {
+    originalRemoveItem.call(this, chave);
+    if (this === localStorage && chave !== CHAVE_META && chave.indexOf(PREFIXO_SINCRONIZADO) === 0) {
+      agendarEnvio(chave, null, true);
+    }
+  };
+
+  // ------------------------- BUSCA (NUVEM → LOCAL) --------------------------
+
+  // -----------------------------------------------------------------------
+  // CORREÇÃO DE PAGINAÇÃO: o Firestore devolve no máximo "pageSize"
+  // documentos por chamada (aqui, 300) e indica em "nextPageToken" se há
+  // mais páginas. Antes, apenas a primeira página era lida — se a coleção
+  // "dados" passasse de 300 registros, os excedentes ficavam invisíveis
+  // para a sincronização (não eram baixados, nem contados para decidir o
+  // que já existe na nuvem). Esta função busca todas as páginas antes de
+  // continuar.
+  // -----------------------------------------------------------------------
+  function buscarTodosOsDocumentos(pageToken, acumulado) {
+    acumulado = acumulado || [];
+    var url = URL_BASE + '?pageSize=300' + (pageToken ? '&pageToken=' + encodeURIComponent(pageToken) : '');
+
+    return fetch(url).then(function (resposta) {
+      if (!resposta.ok) throw new Error('Firestore respondeu ' + resposta.status);
+      return resposta.json();
+    }).then(function (dados) {
+      var documentosDaPagina = (dados && dados.documents) || [];
+      var todos = acumulado.concat(documentosDaPagina);
+      if (dados && dados.nextPageToken) {
+        return buscarTodosOsDocumentos(dados.nextPageToken, todos);
+      }
+      return todos;
+    });
+  }
+
+  // Retorna uma Promise que resolve com "true" se algum dado realmente
+  // diferente foi aplicado ao localStorage nesta rodada (útil para saber
+  // se a tela precisa ser atualizada), ou "false" se nada mudou.
+  function sincronizarUmaVez() {
+    if (!configurado) return Promise.resolve(false);
+
+    // O limite de tempo agora cobre a busca de TODAS as páginas (não só a
+    // primeira), já que uma coleção grande pode precisar de mais de uma
+    // chamada para ser lida por completo.
+    var buscaComLimiteDeTempo = Promise.race([
+      buscarTodosOsDocumentos(),
+      new Promise(function (_, rejeitar) {
+        setTimeout(function () { rejeitar(new Error('tempo de espera esgotado')); }, TEMPO_LIMITE_MS);
+      })
+    ]);
+
+    return buscaComLimiteDeTempo.then(function (documentos) {
+      var meta = lerMeta();
+      var chavesQueAJaEstaoNaNuvem = {};
+      var houveMudancaReal = false;
+
+      // ---------------------------------------------------------------------
+      // MARCADOR DE RESET GLOBAL: se a página "resetar-dados.html" foi usada
+      // em QUALQUER aparelho, ela grava um marcador com a hora do reset. Aqui
+      // comparamos esse marcador com o último reset já aplicado NESTE
+      // aparelho — se for mais novo, apagamos tudo localmente também, sem
+      // precisar que a pessoa clique em nada neste aparelho.
+      // ---------------------------------------------------------------------
+      var docMarcador = documentos.filter(function (doc) {
+        var partes = doc.name.split('/');
+        return partes[partes.length - 1] === CHAVE_MARCADOR_RESET;
+      })[0];
+
+      if (docMarcador) {
+        var infoMarcador = decodificarDocumento(docMarcador.fields);
+        var ultimoResetAplicadoAqui = parseInt(originalGetItem.call(localStorage, CHAVE_RESET_APLICADO) || '0', 10);
+
+        if (infoMarcador.atualizadoEm > ultimoResetAplicadoAqui) {
+          for (var i = localStorage.length - 1; i >= 0; i--) {
+            var chaveParaApagar = localStorage.key(i);
+            if (chaveParaApagar && (chaveParaApagar.indexOf(PREFIXO_SINCRONIZADO) === 0 || chaveParaApagar === CHAVE_META)) {
+              originalRemoveItem.call(localStorage, chaveParaApagar);
+            }
+          }
+          originalSetItem.call(localStorage, CHAVE_RESET_APLICADO, String(infoMarcador.atualizadoEm));
+          // Reset aplicado: não há mais nada local para comparar/enviar
+          // nesta rodada, então encerramos por aqui.
+          return true;
+        }
+      }
+
+      documentos.forEach(function (doc) {
+        var partesDoNome = doc.name.split('/');
+        var chave = partesDoNome[partesDoNome.length - 1];
+        if (chave === CHAVE_MARCADOR_RESET) return;
+        chavesQueAJaEstaoNaNuvem[chave] = true;
+
+        var info = decodificarDocumento(doc.fields);
+        var carimboLocal = meta[chave] || 0;
+        var valorAntesDaAtualizacao = originalGetItem.call(localStorage, chave);
+
+        if (info.apagado) {
+          if (valorAntesDaAtualizacao !== null) {
+            originalRemoveItem.call(localStorage, chave);
+            houveMudancaReal = true;
+          }
+          meta[chave] = info.atualizadoEm;
+          return;
+        }
+
+        if (info.valor !== null && info.atualizadoEm >= carimboLocal) {
+          if (info.valor !== valorAntesDaAtualizacao) {
+            originalSetItem.call(localStorage, chave, info.valor);
+            houveMudancaReal = true;
+          }
+          meta[chave] = info.atualizadoEm;
+        }
+      });
+
+      // Qualquer dado local que a nuvem ainda não conhece é enviado agora,
+      // "semeando" a nuvem (útil na primeira vez que a sincronização roda).
+      for (var i = 0; i < localStorage.length; i++) {
+        var chaveLocal = localStorage.key(i);
+        if (chaveLocal && chaveLocal !== CHAVE_META &&
+            chaveLocal.indexOf(PREFIXO_SINCRONIZADO) === 0 &&
+            !chavesQueAJaEstaoNaNuvem[chaveLocal]) {
+          var valorLocal = originalGetItem.call(localStorage, chaveLocal);
+          if (valorLocal !== null) agendarEnvio(chaveLocal, valorLocal, false);
+        }
+      }
+
+      salvarMeta(meta);
+      return houveMudancaReal;
+    }).catch(function (erro) {
+      console.warn(
+        '[JETCONTROL SYNC] Não foi possível buscar dados da nuvem agora (seguindo com dados locais). Detalhe:',
+        erro && erro.message
+      );
+      return false;
+    });
+  }
+
+  // Promise pública. Cada página aguarda por ela (com segurança, mesmo se
+  // falhar) antes de ler o localStorage, garantindo que dados vindos de
+  // outro aparelho já estejam disponíveis assim que a tela é montada.
+  window.JetSyncReady = sincronizarUmaVez();
+
+  window.JetSyncStatus = function () {
+    return configurado
+      ? 'Sincronização em nuvem ATIVA (projeto: ' + FIREBASE_PROJECT_ID + ')'
+      : 'Sincronização em nuvem NÃO CONFIGURADA (edite jetcontrol-sync.js)';
+  };
+
+  // ------------------- ATUALIZAÇÃO EM TEMPO REAL (POLLING) -------------------
+  // Cada página pode se inscrever para ser avisada quando dados vindos de
+  // OUTRO navegador/aparelho chegarem, e então atualizar só a exibição na
+  // tela (sem precisar apertar F5 e sem mexer no que o usuário estiver
+  // digitando no momento).
+  var INTERVALO_VERIFICACAO_MS = 4000;
+  var ouvintes = [];
+  var cicloAgendado = null;
+  var verificandoAgora = false;
+
+  window.JetSyncOnChange = function (funcaoOuvinte) {
+    if (typeof funcaoOuvinte === 'function') ouvintes.push(funcaoOuvinte);
+  };
+
+  function avisarOuvintes() {
+    ouvintes.forEach(function (fn) {
+      try { fn(); } catch (e) { console.error('[JETCONTROL SYNC] Erro ao atualizar a tela:', e); }
+    });
+  }
+
+  function cicloDeVerificacao() {
+    if (document.visibilityState !== 'visible') {
+      agendarProximoCiclo();
+      return;
+    }
+    verificandoAgora = true;
+    reenviarFila().then(function () { return sincronizarUmaVez(); }).then(function (houveMudanca) {
+      verificandoAgora = false;
+      if (houveMudanca) avisarOuvintes();
+      agendarProximoCiclo();
+    });
+  }
+
+  function agendarProximoCiclo() {
+    clearTimeout(cicloAgendado);
+    cicloAgendado = setTimeout(cicloDeVerificacao, INTERVALO_VERIFICACAO_MS);
+  }
+
+  if (configurado) {
+    agendarProximoCiclo();
+    // Reenvia o que ficou pendente de uma sessão anterior (ex.: editou offline e fechou o app).
+    window.JetSyncReady.then(function () { return reenviarFila(); }, function () {});
+
+    // Ao voltar para a aba (trocar de janela/aplicativo e retornar),
+    // verifica na hora em vez de esperar o próximo ciclo.
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState === 'visible' && !verificandoAgora) {
+        clearTimeout(cicloAgendado);
+        cicloDeVerificacao();
+      }
+    });
+  }
+})();
